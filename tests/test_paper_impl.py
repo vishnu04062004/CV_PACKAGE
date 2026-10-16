@@ -14,6 +14,7 @@ from paper_impl.segmentation import (
     SegmentationConfig,
     fill_holes,
     local_entropy,
+    remove_border_components,
     remove_small_components,
 )
 
@@ -32,6 +33,14 @@ class PaperImplementationTests(unittest.TestCase):
         filled = fill_holes(cleaned)
         self.assertEqual(int(cleaned[2, 2]), 0)
         self.assertEqual(int(filled[17, 17]), 255)
+
+    def test_border_components_are_removed(self):
+        mask = np.zeros((40, 40), dtype=np.uint8)
+        mask[0:10, 2:12] = 255
+        mask[15:30, 15:30] = 255
+        cleaned = remove_border_components(mask)
+        self.assertEqual(int(cleaned[2, 5]), 0)
+        self.assertEqual(int(cleaned[20, 20]), 255)
 
     def test_eight_features_for_rectangle(self):
         mask = np.zeros((100, 120), dtype=np.uint8)
@@ -52,6 +61,23 @@ class PaperImplementationTests(unittest.TestCase):
         ).segment(image)
         self.assertEqual(result.mask.shape, image.shape[:2])
         self.assertGreater(np.count_nonzero(result.mask), 0)
+        self.assertIn(result.polarity, {"normal", "inverted"})
+        self.assertGreaterEqual(result.threshold_value, 0.0)
+        self.assertLessEqual(result.threshold_value, 1.0)
+
+    def test_auto_threshold_rejects_border_background(self):
+        image = np.full((200, 240, 3), 128, dtype=np.uint8)
+        rng = np.random.default_rng(9)
+        image[65:145, 75:170] = rng.integers(0, 256, (80, 95, 3), dtype=np.uint8)
+        result = PaperSegmenter(
+            SegmentationConfig(min_object_area=100, close_kernel=5)
+        ).segment(image)
+        ys, xs = np.nonzero(result.mask)
+        self.assertGreater(len(xs), 0)
+        self.assertGreater(xs.min(), 0)
+        self.assertGreater(ys.min(), 0)
+        self.assertLess(xs.max(), image.shape[1] - 1)
+        self.assertLess(ys.max(), image.shape[0] - 1)
 
     def test_mask_metrics(self):
         truth = np.zeros((10, 10), dtype=np.uint8)

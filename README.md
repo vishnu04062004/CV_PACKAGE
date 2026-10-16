@@ -37,8 +37,11 @@ images are available from the corresponding author on request. Consequently,
 this code can reproduce the published algorithm but cannot honestly reproduce
 the paper's numerical results without those inputs.
 
-The default 9x9 entropy neighborhood follows MATLAB `entropyfilt`; Otsu is used
-when no threshold is supplied. The morphology element defaults to a 9x9
+The default 9x9 entropy neighborhood follows MATLAB `entropyfilt`. Because the
+paper does not publish its threshold or polarity, automatic mode evaluates Otsu
+and entropy-percentile candidates in both directions, preferring an enclosed
+component rather than border-connected pavement. It prints the chosen value and
+direction for reproducibility. The morphology element defaults to a 9x9
 ellipse. Each unpublished parameter is exposed by the command line.
 
 ## Install and run
@@ -60,6 +63,12 @@ To use a fixed normalized threshold, for example:
 
 ```powershell
 python -m paper_impl.cli segment image.jpg --threshold 0.45 --close-kernel 9
+```
+
+The polarity can be fixed when reproducing an experiment exactly:
+
+```powershell
+python -m paper_impl.cli segment image.jpg --threshold 0.82 --polarity normal
 ```
 
 Training data must have the paper's four labels as directory names:

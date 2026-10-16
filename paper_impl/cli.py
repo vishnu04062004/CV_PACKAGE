@@ -13,7 +13,18 @@ from .segmentation import PaperSegmenter, SegmentationConfig, read_image
 
 def add_segmentation_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--entropy-window", type=int, default=9)
-    parser.add_argument("--threshold", type=float, default=None, help="Normalized [0,1]; default is Otsu")
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
+        help="Fixed normalized threshold [0,1]; default auto-searches candidates",
+    )
+    parser.add_argument(
+        "--polarity",
+        choices=("auto", "normal", "inverted"),
+        default="auto",
+        help="Threshold direction; auto also searches entropy percentiles",
+    )
     parser.add_argument("--min-object-area", type=int, default=1500)
     parser.add_argument("--close-kernel", type=int, default=9)
     parser.add_argument("--close-iterations", type=int, default=1)
@@ -25,6 +36,7 @@ def config_from_args(args: argparse.Namespace) -> SegmentationConfig:
     return SegmentationConfig(
         entropy_window=args.entropy_window,
         threshold=args.threshold,
+        polarity=args.polarity,
         min_object_area=args.min_object_area,
         close_kernel=args.close_kernel,
         close_iterations=args.close_iterations,
@@ -58,6 +70,8 @@ def command_segment(args: argparse.Namespace) -> None:
     report = {
         "is_defect": result.is_defect,
         "foreground_ratio": result.foreground_ratio,
+        "selected_threshold": result.threshold_value,
+        "selected_polarity": result.polarity,
         "features": dict(zip(FEATURE_NAMES, map(float, features))),
     }
     if (args.scale_length_cm is None) != (args.scale_length_pixels is None):

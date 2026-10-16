@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import cv2
 import numpy as np
@@ -19,6 +20,7 @@ import numpy as np
 class SegmentationConfig:
     entropy_window: int = 9
     threshold: float | None = None
+    polarity: Literal["auto", "normal", "inverted"] = "auto"
     min_object_area: int = 1500
     close_kernel: int = 9
     close_iterations: int = 1
@@ -30,6 +32,8 @@ class SegmentationConfig:
             raise ValueError("entropy_window must be a positive odd integer")
         if self.threshold is not None and not 0.0 <= self.threshold <= 1.0:
             raise ValueError("threshold must be in [0, 1]")
+        if self.polarity not in {"auto", "normal", "inverted"}:
+            raise ValueError("polarity must be auto, normal, or inverted")
         if self.min_object_area < 0:
             raise ValueError("min_object_area must be non-negative")
         if self.close_kernel < 1 or self.close_kernel % 2 == 0:
@@ -51,6 +55,8 @@ class SegmentationResult:
     overlay: np.ndarray
     foreground_ratio: float
     is_defect: bool
+    threshold_value: float
+    polarity: str
 
 
 def read_image(path: str | Path) -> np.ndarray:
@@ -133,6 +139,36 @@ def largest_component(mask: np.ndarray) -> np.ndarray:
     return np.where(labels == label, 255, 0).astype(np.uint8)
 
 
+def largest_interior_component(mask: np.ndarray) -> tuple[np.ndarray, int]:
+    """Return the largest component not connected to an image border."""
+    binary = (mask > 0).astype(np.uint8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    height, width = binary.shape
+    candidates: list[tuple[int, int]] = []
+    for label in range(1, count):
+        x, y, w, h, area = map(int, stats[label])
+        touches_border = x == 0 or y == 0 or x + w == width or y + h == height
+        if not touches_border:
+            candidates.append((area, label))
+    if not candidates:
+        return np.zeros_like(mask, dtype=np.uint8), 0
+    area, label = max(candidates)
+    return np.where(labels == label, 255, 0).astype(np.uint8), area
+
+
+def remove_border_components(mask: np.ndarray) -> np.ndarray:
+    """Remove connected foreground regions that merge with an image border."""
+    binary = (mask > 0).astype(np.uint8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    height, width = binary.shape
+    output = np.zeros_like(mask, dtype=np.uint8)
+    for label in range(1, count):
+        x, y, w, h, _ = map(int, stats[label])
+        if x > 0 and y > 0 and x + w < width and y + h < height:
+            output[labels == label] = 255
+    return output
+
+
 def make_overlay(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
     overlay = image.copy()
     green = np.zeros_like(image)
@@ -156,28 +192,67 @@ class PaperSegmenter:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         entropy = local_entropy(gray, cfg.entropy_window)
         entropy_gray = normalize_u8(entropy)
-
-        if cfg.threshold is None:
-            _, binary = cv2.threshold(
-                entropy_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-            )
-        else:
-            _, binary = cv2.threshold(
-                entropy_gray, int(round(cfg.threshold * 255)), 255, cv2.THRESH_BINARY
-            )
-
-        area_filtered = remove_small_components(binary, cfg.min_object_area)
         kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (cfg.close_kernel, cfg.close_kernel)
         )
-        morph_closed = cv2.morphologyEx(
-            area_filtered,
-            cv2.MORPH_CLOSE,
-            kernel,
-            iterations=cfg.close_iterations,
+
+        def process_candidate(threshold_value: int, polarity: str) -> tuple[np.ndarray, ...]:
+            threshold_type = cv2.THRESH_BINARY if polarity == "normal" else cv2.THRESH_BINARY_INV
+            _, candidate_binary = cv2.threshold(
+                entropy_gray, threshold_value, 255, threshold_type
+            )
+            candidate_filtered = remove_small_components(candidate_binary, cfg.min_object_area)
+            candidate_closed = cv2.morphologyEx(
+                candidate_filtered,
+                cv2.MORPH_CLOSE,
+                kernel,
+                iterations=cfg.close_iterations,
+            )
+            candidate_components = fill_holes(candidate_closed)
+            candidate_interior, candidate_area = largest_interior_component(candidate_components)
+            return (
+                candidate_binary,
+                candidate_filtered,
+                candidate_closed,
+                candidate_components,
+                candidate_interior,
+                candidate_area,
+            )
+
+        if cfg.threshold is not None:
+            threshold_values = [int(round(cfg.threshold * 255))]
+        elif cfg.polarity == "auto":
+            otsu_value, _ = cv2.threshold(
+                entropy_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+            )
+            percentiles = np.percentile(entropy_gray, np.arange(55, 96, 5))
+            threshold_values = sorted({int(round(otsu_value)), *(int(round(v)) for v in percentiles)})
+        else:
+            otsu_value, _ = cv2.threshold(
+                entropy_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+            )
+            threshold_values = [int(round(otsu_value))]
+
+        polarities = [cfg.polarity] if cfg.polarity != "auto" else ["normal", "inverted"]
+        candidates: list[tuple[int, int, str, tuple[np.ndarray, ...]]] = []
+        for threshold_value in threshold_values:
+            for polarity in polarities:
+                stages = process_candidate(threshold_value, polarity)
+                candidates.append((int(stages[-1]), threshold_value, polarity, stages))
+
+        # A pothole is an enclosed pavement region. Prefer the largest candidate
+        # that does not merge with an image border. If none exists, retain the
+        # ordinary largest domain so explicit/manual workflows still yield output.
+        interior_area, chosen_threshold, chosen_polarity, chosen = max(
+            candidates, key=lambda candidate: candidate[0]
         )
-        all_components = fill_holes(morph_closed)
-        mask = largest_component(all_components) if cfg.keep_largest else all_components.copy()
+        binary, area_filtered, morph_closed, all_components, interior_mask, _ = chosen
+        if cfg.polarity == "auto" and interior_area > 0:
+            all_components = remove_border_components(all_components)
+        if cfg.keep_largest:
+            mask = largest_component(all_components)
+        else:
+            mask = all_components.copy()
         foreground_ratio = float(np.count_nonzero(all_components)) / float(all_components.size)
 
         return SegmentationResult(
@@ -192,5 +267,7 @@ class PaperSegmenter:
             overlay=make_overlay(image, mask),
             foreground_ratio=foreground_ratio,
             is_defect=foreground_ratio >= cfg.nondefect_ratio,
+            threshold_value=chosen_threshold / 255.0,
+            polarity=chosen_polarity,
         )
 
